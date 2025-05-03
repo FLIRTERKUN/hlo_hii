@@ -1,0 +1,15 @@
+user:
+  name: Souradeep Mondal
+  github: HBGauction
+
+language: "python"
+python_version: "3.10"
+
+commands:
+  build:
+    - "pip install -r requirements.txt"
+  start:
+    - "python start.py"
+
+env:
+  - "ENVIRONMENT=production"
