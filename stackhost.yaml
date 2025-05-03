@@ -9,7 +9,7 @@ commands:
   build:
     - "pip install -r requirements.txt"
   start:
-    - "python start.py"
+    - "python -m Grabber"
 
 env:
   - "ENVIRONMENT=production"
