@@ -6,6 +6,8 @@ import random
 from . import sudo_filter, app
 from Grabber import application, collection, db, CHARA_CHANNEL_ID, user_collection
 from . import uploader_filter
+from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated
+# You already have this
 
 async def get_next_sequence_number(sequence_name):
     sequence_collection = db.sequences
@@ -36,6 +38,171 @@ rarity_map = {
     14: "🍥 Retro"
 }
 
+
+# Ensure these are imported or defined in the same scope:
+# from . import sudo_filter, app # Assuming 'app' is your Client instance
+# from Grabber import collection, db, CHARA_CHANNEL_ID, user_collection # Assuming these are your MongoDB collections and channel ID
+# from . import uploader_filter # Your uploader filter
+# async def get_next_sequence_number(sequence_name): ... # Your function
+# rarity_map = { ... } # Your rarity map
+
+# --- Make sure 'app', 'collection', 'db', 'CHARA_CHANNEL_ID', 'uploader_filter',
+# --- 'get_next_sequence_number', and 'rarity_map' are correctly defined and accessible.
+
+# If 'uploader_filter' is not defined yet, create a simple one (e.g., based on user IDs)
+# For example, replace UPLOADER_USER_IDS with actual admin/uploader Telegram IDs
+# uploader_ids = [123456789, 987654321] # Example Uploader IDs
+# uploader_filter = filters.user(uploader_ids)
+# If you use sudo_filter for uploaders, you can use that:
+# from . import sudo_filter as uploader_filter # If sudo users are uploaders
+
+# Dictionary to store upload states for users (simple in-memory state management)
+# For a more robust solution, you might use a database or a more advanced state manager
+upload_sessions = {}
+
+# --- UPLOAD COMMAND LOGIC ---
+
+UPLOAD_STEPS = {
+    "ASK_PHOTO": 1,
+    "ASK_NAME": 2,
+    "ASK_ANIME": 3,
+    "ASK_RARITY": 4,
+    "CONFIRM": 5,
+}
+
+@app.on_message(filters.command("upload") & uploader_filter)
+async def start_upload(client: Client, message: Message):
+    user_id = message.from_user.id
+    upload_sessions[user_id] = {"step": UPLOAD_STEPS["ASK_PHOTO"], "data": {}}
+    await message.reply_text(
+        "Okay, let's upload a new character!\n"
+        "Please send me the **image/photo** for the character."
+    )
+
+@app.on_message(filters.photo & uploader_filter & filters.private) # Listen for photos in private chat
+async def handle_upload_photo(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id in upload_sessions and upload_sessions[user_id]["step"] == UPLOAD_STEPS["ASK_PHOTO"]:
+        if message.photo:
+            # Forward the photo to your character channel
+            try:
+                forwarded_message = await message.forward(CHARA_CHANNEL_ID)
+                upload_sessions[user_id]["data"]["img_message_id"] = forwarded_message.id
+                upload_sessions[user_id]["data"]["img_chat_id"] = forwarded_message.chat.id # Should be CHARA_CHANNEL_ID
+                upload_sessions[user_id]["data"]["img_file_unique_id"] = message.photo.file_unique_id # Good for reference
+                upload_sessions[user_id]["step"] = UPLOAD_STEPS["ASK_NAME"]
+                await message.reply_text("Image received! Now, what's the character's **name**?")
+            except (FloodWait, UserIsBlocked, InputUserDeactivated) as e:
+                await message.reply_text(f"Could not forward image to character channel: {e}. Aborting upload.")
+                del upload_sessions[user_id]
+            except Exception as e:
+                print(f"Error forwarding image: {e}")
+                await message.reply_text("An error occurred while processing the image. Aborting upload.")
+                del upload_sessions[user_id]
+        else:
+            await message.reply_text("That wasn't a photo. Please send a photo.")
+    # Else, it's a random photo not part of an upload session, or wrong step
+
+@app.on_message(filters.text & uploader_filter & filters.private & ~filters.command(None)) # Listen for text, not commands
+async def handle_upload_text_input(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in upload_sessions:
+        return # Not in an upload session
+
+    session = upload_sessions[user_id]
+    text = message.text.strip()
+
+    if session["step"] == UPLOAD_STEPS["ASK_NAME"]:
+        session["data"]["name"] = text.title()
+        session["step"] = UPLOAD_STEPS["ASK_ANIME"]
+        await message.reply_text(f"Name set to: {session['data']['name']}\n"
+                                 "What **anime/series** is this character from?")
+
+    elif session["step"] == UPLOAD_STEPS["ASK_ANIME"]:
+        session["data"]["anime"] = text.title()
+        session["step"] = UPLOAD_STEPS["ASK_RARITY"]
+        rarity_options = "\n".join([f"{k}: {v}" for k, v in rarity_map.items()])
+        await message.reply_text(f"Series set to: {session['data']['anime']}\n"
+                                 f"What is the **rarity**? (Enter the number):\n{rarity_options}")
+
+    elif session["step"] == UPLOAD_STEPS["ASK_RARITY"]:
+        try:
+            rarity_num = int(text)
+            if rarity_num in rarity_map:
+                session["data"]["rarity_key"] = rarity_num # Store key for display
+                session["data"]["rarity_value"] = rarity_map[rarity_num] # Store full string for DB
+                session["step"] = UPLOAD_STEPS["CONFIRM"]
+
+                # --- Prepare for confirmation ---
+                char_data = session['data']
+                confirmation_text = (
+                    "**Please confirm the details:**\n"
+                    f"**Name:** {char_data['name']}\n"
+                    f"**Series:** {char_data['anime']}\n"
+                    f"**Rarity:** {char_data['rarity_value']} ({char_data['rarity_key']})\n"
+                    f"**Image:** (Forwarded to channel, message ID: {char_data['img_message_id']})\n\n"
+                    "Type `/confirm_upload` to save or `/cancel_upload` to abort."
+                )
+                await message.reply_text(confirmation_text)
+            else:
+                await message.reply_text("Invalid rarity number. Please choose from the list.")
+        except ValueError:
+            await message.reply_text("That's not a valid number for rarity. Please try again.")
+
+@app.on_message(filters.command("confirm_upload") & uploader_filter & filters.private)
+async def confirm_and_save_upload(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id in upload_sessions and upload_sessions[user_id]["step"] == UPLOAD_STEPS["CONFIRM"]:
+        data_to_save = upload_sessions[user_id]["data"]
+        try:
+            new_id_num = await get_next_sequence_number("character_id")
+            new_id_str = str(new_id_num).zfill(2) # Or however you format your IDs
+
+            character_doc = {
+                "id": new_id_str,
+                "name": data_to_save["name"],
+                "anime": data_to_save["anime"],
+                "rarity": data_to_save["rarity_value"], # Storing the full string e.g. "🟢 Common"
+                "img_url": f"https://t.me/c/{str(CHARA_CHANNEL_ID).replace('-100', '')}/{data_to_save['img_message_id']}", # Link to image in channel
+                "message_id": data_to_save["img_message_id"], # Store message_id for deletion later if needed
+                "uploader_id": user_id,
+                # Add any other fields your schema requires, e.g., upload_date
+                # "upload_date": datetime.utcnow() # if you import datetime
+            }
+
+            await collection.insert_one(character_doc)
+            await message.reply_text(
+                f"✅ Character '{data_to_save['name']}' (ID: {new_id_str}) successfully uploaded and saved to the database!"
+            )
+
+        except Exception as e:
+            print(f"Error saving character to MongoDB: {e}")
+            await message.reply_text(f"An error occurred while saving to the database: {e}. Please try again or contact an admin.")
+        finally:
+            del upload_sessions[user_id] # Clean up session
+    else:
+        await message.reply_text("No active upload to confirm or you are not at the confirmation step. Start with /upload.")
+
+@app.on_message(filters.command("cancel_upload") & uploader_filter & filters.private)
+async def cancel_upload_process(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id in upload_sessions:
+        # Optionally, try to delete the forwarded image from CHARA_CHANNEL_ID if it was already sent
+        if "img_message_id" in upload_sessions[user_id]["data"]:
+            try:
+                await client.delete_messages(
+                    chat_id=CHARA_CHANNEL_ID,
+                    message_ids=upload_sessions[user_id]["data"]["img_message_id"]
+                )
+            except Exception as e:
+                print(f"Could not delete temp image from channel on cancel: {e}")
+        
+        del upload_sessions[user_id]
+        await message.reply_text("Upload cancelled.")
+    else:
+        await message.reply_text("No active upload process to cancel.")
+
+# --- END UPLOAD COMMAND LOGIC ---
 
 @app.on_message(filters.command('delete') & sudo_filter)
 async def delete(client: Client, message: Message):
